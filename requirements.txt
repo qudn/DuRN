@@ -1,11 +1,5 @@
-# 基础数学与数据处理
 numpy>=1.20.0
 pandas>=1.3.0
 scipy>=1.7.0
-
-# 机器学习工具 (用于 StandardScaler, metrics, NearestNeighbors 等)
 scikit-learn>=1.0.0
-
-# 深度学习框架 (ResRPR 核心实现)
-# 建议根据您的 CUDA 版本选择对应的 torch 版本
 torch>=1.10.0
