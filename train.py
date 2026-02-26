@@ -15,12 +15,9 @@ import sys
 
 warnings.filterwarnings("ignore")
 
-# ==================== 配置区域 ====================
+# ==================== Configuration Area ====================
 DATA_DIRS = [
-    '/home/yc/temp/XRAD/TCCM-NIPS-main/datasets/small',
-    '/home/yc/temp/XRAD/TCCM-NIPS-main/datasets/medium',
-    '/home/yc/temp/XRAD/TCCM-NIPS-main/datasets/large',
-    '/home/yc/temp/XRAD/TCCM-NIPS-main/datasets/high_dim'
+    'datasets' # Update this to the actual dataset directory path
 ]
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -28,15 +25,17 @@ BATCH_SIZE = 1024
 MAX_EPOCHS = 30
 ENSEMBLE_SIZE = 5
 KNN_K = 5
-OUTPUT_FILE = "final_benchmark_dual_view.csv" # 保持文件名以便后续脚本使用
+OUTPUT_FILE = "final_benchmark_dual_view.csv" # Keep filename for compatibility with downstream scripts
 
-# ==================== ResRPR 模型 ====================
+# ==================== ResRPR Model ====================
 class ResRPR(nn.Module):
     def __init__(self, input_dim, proj_dim, seed):
         super().__init__()
         torch.manual_seed(seed)
+        # Random weight matrix W for target projection
         self.W = nn.Parameter(torch.randn(input_dim, proj_dim), requires_grad=False)
         nn.init.orthogonal_(self.W)
+        
         hidden_dim = min(256, input_dim * 4 + 64)
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU(),
@@ -50,19 +49,21 @@ class ResRPR(nn.Module):
         return pred
 
     def get_target(self, x):
+        # Negative selection / Identity mapping avoidance via random projection
         return x @ self.W
 
-# ==================== 核心逻辑 (Adaptive Hard Gating) ====================
+# ==================== Core Logic (Adaptive Hard Gating) ====================
 def run_method(X_train, X_test, y_test):
     dim = X_train.shape[1]
     
-    # --- View I: Raw Space ---
+    # --- View I: Raw Space (Topological Safety Net) ---
+    # Sample if training data is too large to maintain efficiency
     knn_ref = X_train if len(X_train) < 10000 else X_train[np.random.choice(len(X_train), 10000, replace=False)]
     knn = NearestNeighbors(n_neighbors=KNN_K, n_jobs=-1).fit(knn_ref)
     dist_raw, _ = knn.kneighbors(X_test)
     s_raw = dist_raw.mean(axis=1)
 
-    # --- View II: Deep Space & Uncertainty ---
+    # --- View II: Deep Space & Uncertainty (Semantic Booster) ---
     X_tr_t = torch.tensor(X_train, dtype=torch.float32).to(DEVICE)
     ensemble_errors = [] 
     
@@ -80,6 +81,7 @@ def run_method(X_train, X_test, y_test):
             for _ in range(MAX_EPOCHS):
                 for (bx,) in loader:
                     target = model.get_target(bx)
+                    # Add small noise to enforce robustness and prevent manifold folding
                     noise = torch.randn_like(bx) * 0.01
                     pred = model(bx + noise)
                     loss = loss_fn(pred, target)
@@ -100,7 +102,7 @@ def run_method(X_train, X_test, y_test):
         except: continue
 
     if not ensemble_errors:
-        # Fallback if deep fails completely
+        # Fallback if deep view fails completely
         if len(np.unique(y_test)) < 2: return 0, 0
         return roc_auc_score(y_test, s_raw), average_precision_score(y_test, s_raw)
 
@@ -116,9 +118,9 @@ def run_method(X_train, X_test, y_test):
     w_deep = np.zeros_like(s_deep)
     w_raw = np.ones_like(s_raw)
 
-    # Hard Thresholds (Consistent with ablation)
-    threshold_high = 0.5   # Unstable -> Kill Deep
-    threshold_low = -0.5   # Stable -> Boost Deep
+    # Hard Thresholds (Consistent with ablation settings)
+    threshold_high = 0.5   # Unstable/High Uncertainty -> Prioritize Raw View
+    threshold_low = -0.5   # Stable/Low Uncertainty -> Prioritize Deep View
 
     for i in range(len(u_norm)):
         if u_norm[i] > threshold_high:
@@ -128,13 +130,13 @@ def run_method(X_train, X_test, y_test):
         else:
             w_deep[i] = 0.5; w_raw[i] = 0.5
             
-    # Fusion
+    # Fusion via Rank Alignment
     s_final = w_raw * rankdata(s_raw) + w_deep * rankdata(s_deep)
     
     if len(np.unique(y_test)) < 2: return 0, 0
     return roc_auc_score(y_test, s_final), average_precision_score(y_test, s_final)
 
-# ==================== 数据处理 ====================
+# ==================== Data Processing ====================
 def load_data(file_path):
     try:
         data = np.load(file_path, allow_pickle=True)
@@ -147,6 +149,7 @@ def load_data(file_path):
         X_normal = X[y == 0]; X_anomalous = X[y == 1]
         y_normal = y[y == 0]; y_anomalous = y[y == 1]
         
+        # Split normal data: 50% for training (unsupervised), 50% for testing
         X_train, X_test_normal, y_train, y_test_normal = train_test_split(
             X_normal, y_normal, test_size=0.5, random_state=42, stratify=y_normal
         )
@@ -179,16 +182,16 @@ def main():
             roc, pr = run_method(X_tr, X_te, y_te)
             print(f"{name:<20} | {roc:.4f}     | {pr:.4f}")
             
-            # 保存关键列，适配 gen_latex.py
+            # Save columns for compatibility with gen_latex.py
             results.append({
                 'Dataset': name,
-                'Dual': roc,     # ROC 列
-                'Ours_PR': pr    # PR 列
+                'Dual': roc,     # ROC Column
+                'Ours_PR': pr    # PR Column
             })
         except KeyboardInterrupt: break
         except Exception: continue
         
-    # 保存结果
+    # Save Results
     if results:
         df = pd.DataFrame(results)
         df.to_csv(OUTPUT_FILE, index=False)
